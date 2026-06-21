@@ -1,0 +1,163 @@
+# Cloud Build CI/CD for GCP Cloud Run deployment
+#
+# ── One-time GCP setup (run these commands once, before first deploy) ────────
+#
+# 1. Enable required APIs:
+#      gcloud services enable \
+#        run.googleapis.com sqladmin.googleapis.com \
+#        artifactregistry.googleapis.com secretmanager.googleapis.com
+#
+# 2. Create Artifact Registry repository:
+#      gcloud artifacts repositories create freelance \
+#        --repository-format=docker --location=<_REGION>
+#
+# 3. Create a Cloud SQL instance (PostgreSQL 15):
+#      gcloud sql instances create freelance-db \
+#        --database-version=POSTGRES_15 \
+#        --region=<_REGION> \
+#        --tier=db-f1-micro
+#
+# 4. Create the database and user:
+#      gcloud sql databases create freelance_db --instance=freelance-db
+#      gcloud sql users create freelance --instance=freelance-db \
+#        --password=<choose-a-strong-password>
+#
+# 5. Get the Cloud SQL instance connection name (needed below):
+#      gcloud sql instances describe freelance-db --format='value(connectionName)'
+#      # e.g.  myproject:europe-west1:freelance-db  ← set this as _CLOUDSQL_INSTANCE
+#
+# 6. Store secrets in Secret Manager.
+#    DATABASE_URL must use the Cloud SQL Unix-socket path (not TCP):
+#      echo -n "postgresql://freelance:<password>@/freelance_db?host=/cloudsql/<connectionName>" \
+#        | gcloud secrets create freelance-db-url --data-file=-
+#
+#    SECRET_KEY is the JWT signing secret (use a long random string):
+#      python3 -c "import secrets; print(secrets.token_hex(32))" \
+#        | gcloud secrets create freelance-secret-key --data-file=-
+#
+# 7. Grant the default Compute service account the necessary roles:
+#      PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
+#      SA="$PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+#
+#      gcloud projects add-iam-policy-binding $PROJECT_ID \
+#        --member="serviceAccount:$SA" --role="roles/cloudsql.client"
+#
+#      gcloud secrets add-iam-policy-binding freelance-db-url \
+#        --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
+#      gcloud secrets add-iam-policy-binding freelance-secret-key \
+#        --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
+#
+# 8. Grant Cloud Build permission to deploy Cloud Run services:
+#      gcloud projects add-iam-policy-binding $PROJECT_ID \
+#        --member="serviceAccount:$PROJECT_NUMBER@cloudbuild.gserviceaccount.com" \
+#        --role="roles/run.admin"
+#      gcloud projects add-iam-policy-binding $PROJECT_ID \
+#        --member="serviceAccount:$PROJECT_NUMBER@cloudbuild.gserviceaccount.com" \
+#        --role="roles/iam.serviceAccountUser"
+#
+# ── Substitutions to configure in the Cloud Build trigger ───────────────────
+#   _REGION            e.g. europe-west1
+#   _CLOUDSQL_INSTANCE e.g. myproject:europe-west1:freelance-db
+#
+# Local Docker Compose setup is unchanged — this file only runs on GCP.
+# Note: file uploads on Cloud Run land in /tmp (ephemeral). For persistent
+#       uploads across restarts, mount a Cloud Storage FUSE bucket instead.
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: freelance              # Artifact Registry repository name
+  _CLOUDSQL_INSTANCE: ''        # Set in trigger: PROJECT_ID:REGION:freelance-db
+
+steps:
+  # ── Build images ──────────────────────────────────────────────────────────
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$COMMIT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:latest
+      - ./backend
+
+  - id: build-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$COMMIT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:latest
+      - ./frontend
+    waitFor: ['-']  # run in parallel with build-backend
+
+  # ── Push images ───────────────────────────────────────────────────────────
+  - id: push-backend
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend]
+    waitFor: [build-backend]
+
+  - id: push-frontend
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend]
+    waitFor: [build-frontend]
+
+  # ── Deploy backend ────────────────────────────────────────────────────────
+  # DATABASE_URL and SECRET_KEY are fetched from Secret Manager by Cloud Run at
+  # runtime (--set-secrets). The Cloud SQL Auth Proxy socket is mounted via
+  # --add-cloudsql-instances; the DATABASE_URL secret must use the socket path:
+  #   postgresql://user:pass@/dbname?host=/cloudsql/<_CLOUDSQL_INSTANCE>
+  - id: deploy-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - freelance-backend
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --add-cloudsql-instances=$_CLOUDSQL_INSTANCE
+      - --set-secrets=DATABASE_URL=freelance-db-url:latest,SECRET_KEY=freelance-secret-key:latest
+      - --set-env-vars=UPLOAD_DIR=/tmp/uploads,FRANKFURTER_URL=https://api.frankfurter.dev
+    waitFor: [push-backend]
+
+  # ── Discover backend URL for frontend proxy ───────────────────────────────
+  # Cloud Run assigns a stable HTTPS URL to each service. We read it here and
+  # pass it to the frontend container via BACKEND_URL so that nginx can proxy
+  # /api/* to the correct Cloud Run backend service.
+  - id: get-backend-url
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run services describe freelance-backend \
+          --region=$_REGION --format='value(status.url)' \
+          > /workspace/backend_url.txt
+        echo "Backend URL: $(cat /workspace/backend_url.txt)"
+    waitFor: [deploy-backend]
+
+  # ── Deploy frontend ───────────────────────────────────────────────────────
+  - id: deploy-frontend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        BACKEND_URL=$(cat /workspace/backend_url.txt)
+        gcloud run deploy freelance-frontend \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$COMMIT_SHA \
+          --region=$_REGION \
+          --platform=managed \
+          --allow-unauthenticated \
+          --set-env-vars="BACKEND_URL=$BACKEND_URL"
+    waitFor: [push-frontend, get-backend-url]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/backend:$COMMIT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$COMMIT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
